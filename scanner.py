@@ -12,8 +12,6 @@ def export_sanjuk_format(df_results, filename="sanjuk_watchlist.txt"):
         return ""
 
     codes = [str(row['代碼']).strip() for _, row in df_results.iterrows()]
-    
-    # 支援空白與逗號格式
     sanjuk_str = ",".join(codes)
 
     output_path = os.path.join(os.getcwd(), filename)
@@ -34,18 +32,27 @@ def get_all_taiwan_tickers():
     
     tickers = {}
 
-    # 1. 抓取上市股票 (.TW)
-    try:
-        twse_url = "https://www.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
-        res = requests.get(twse_url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            for row in res.json():
-                code = str(row.get('Code', '')).strip()
-                name = str(row.get('Name', '')).strip()
-                if len(code) == 4 and code.isdigit():
-                    tickers[f"{code}.TW"] = name
-    except Exception:
-        pass
+    # 1. 抓取上市股票 (.TW) - 使用正確的證交所 OpenAPI 網址
+    twse_urls = [
+        "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
+        "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+    ]
+    
+    for url in twse_urls:
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) > 0:
+                    for row in data:
+                        code = str(row.get('Code') or row.get('StockNo') or '').strip()
+                        name = str(row.get('Name') or '').strip()
+                        if len(code) == 4 and code.isdigit():
+                            tickers[f"{code}.TW"] = name
+                    if len(tickers) > 0:
+                        break
+        except Exception:
+            continue
 
     # 2. 抓取上櫃股票 (.TWO)
     tpex_sources = [
@@ -71,8 +78,7 @@ def get_all_taiwan_tickers():
                         name = str(
                             row.get('CompanyName') or 
                             row.get('SecName') or 
-                            row.get('Name') or 
-                            row.get('AbbreviatedCompanyServices') or ''
+                            row.get('Name') or ''
                         ).strip()
                         
                         if len(code) == 4 and code.isdigit():
@@ -82,6 +88,10 @@ def get_all_taiwan_tickers():
         except Exception:
             continue
 
+    tw_count = sum(1 for k in tickers if k.endswith('.TW'))
+    two_count = sum(1 for k in tickers if k.endswith('.TWO'))
+    print(f"成功載入清單：上市股票 {tw_count} 檔，上櫃股票 {two_count} 檔（總計 {len(tickers)} 檔）。")
+    
     return tickers
 
 
@@ -98,6 +108,7 @@ def calculate_atr(df, period=14):
 def run_daily_scan(progress_callback=None):
     stock_map = get_all_taiwan_tickers()
     total = len(stock_map)
+    print(f"🚀 開始執行全台股盤後掃描，總計 {total} 檔標的...")
 
     if total == 0:
         return pd.DataFrame()
@@ -106,39 +117,40 @@ def run_daily_scan(progress_callback=None):
     ticker_list = list(stock_map.keys())
     
     for idx, ticker in enumerate(ticker_list):
+        current_num = idx + 1
+        percent = (current_num / total) * 100
+        
+        print(f"[{percent:5.1f}%] 掃描進度 ({current_num}/{total}) -> 正在處理: {ticker} {stock_map.get(ticker, '')}")
+
+        if progress_callback:
+            progress_callback(current_num, total, ticker, stock_map.get(ticker, ""))
+
         try:
             df = yf.download(ticker, period="1y", interval="1d", progress=False)
             if df.empty or len(df) < 200:
-                if progress_callback:
-                    progress_callback(idx + 1, total, ticker, stock_map[ticker])
                 continue
             if isinstance(df.columns, pd.MultiIndex):
                 df = df.xs(ticker, level=1, axis=1)
                 
-            # 技術指標基礎計算
             df['MA_20'] = df['Close'].rolling(window=20).mean()
             df['MA_60'] = df['Close'].rolling(window=60).mean()
             df['MA_200'] = df['Close'].rolling(window=200).mean()
             df['MA_Slope'] = df['MA_20'].diff(3)
             
-            # 成交量單位換算為張數
             df['Vol_MA_Lots'] = (df['Volume'].rolling(window=20).mean()) / 1000.0
             df['Vol_Ratio'] = df['Volume'] / (df['Vol_MA_Lots'] * 1000.0)
             df['ATR'] = calculate_atr(df)
             
-            # MACD 計算
             ema12 = df['Close'].ewm(span=12, adjust=False).mean()
             ema26 = df['Close'].ewm(span=26, adjust=False).mean()
             df['DIF'] = ema12 - ema26
             df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
 
-            # 布林通道
             std20 = df['Close'].rolling(window=20).std()
             df['BB_Upper'] = df['MA_20'] + (std20 * 2)
             df['BB_Lower'] = df['MA_20'] - (std20 * 2)
             df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['MA_20']
 
-            # KD 指標
             low_min = df['Low'].rolling(window=9).min()
             high_max = df['High'].rolling(window=9).max()
             rsv = (df['Close'] - low_min) / (high_max - low_min) * 100
@@ -170,25 +182,18 @@ def run_daily_scan(progress_callback=None):
             upper_shadow = float(curr['High']) - max(curr_price, curr_open)
             body_length = abs(curr_price - curr_open)
 
-            # 流動性與假突破濾網
             if np.isnan(vol_ma_lots) or vol_ma_lots < 300.0:
-                if progress_callback:
-                    progress_callback(idx + 1, total, ticker, stock_map[ticker])
                 continue
 
             if upper_shadow > (body_length * 1.5) and upper_shadow > 0:
-                if progress_callback:
-                    progress_callback(idx + 1, total, ticker, stock_map[ticker])
                 continue
 
-            # 多頭總體濾網
             macro_bull = (curr_price > curr_ma60) and (curr_ma60 > curr_ma200)
             macd_bull = (float(curr['DIF']) > float(curr['DEA'])) and (float(curr['DIF']) > 0)
             
             if macro_bull and macd_bull:
                 signals = []
                 
-                # 波段買點
                 if slope >= 0 and prev['Close'] < prev['MA_20'] and curr_price > curr_ma20:
                     if vol_ratio >= 1.3 and pct_change >= 0.015:
                         signals.append("B1 強勢帶量突破")
@@ -199,7 +204,6 @@ def run_daily_scan(progress_callback=None):
                     if (prev['Close'] - prev['MA_20']) / prev['MA_20'] < 0.02 and vol_ratio <= 1.1:
                         signals.append("B3 縮量回測月線支撐")
 
-                # 短線買點
                 kd_gold_cross = (prev_k < prev_d) and (curr_k > curr_d)
                 if kd_gold_cross and curr_k < 50 and vol_ratio >= 1.3 and k_candle_body > 0.015:
                     signals.append("S1 KD低檔金叉爆量攻")
@@ -231,14 +235,15 @@ def run_daily_scan(progress_callback=None):
                     })
         except Exception:
             pass
-        
-        # 即時回報進度給前端 UI
-        if progress_callback:
-            progress_callback(idx + 1, total, ticker, stock_map.get(ticker, ""))
 
     result_df = pd.DataFrame(results)
     output_path = os.path.join(os.getcwd(), "scan_results.csv")
     result_df.to_csv(output_path, index=False, encoding="utf-8-sig")
     export_sanjuk_format(result_df)
     
+    print(f"\n================ 掃描完成 ================")
+    print(f"共篩選出符合條件的高勝率標的：{len(result_df)} 檔")
     return result_df
+
+if __name__ == "__main__":
+    run_daily_scan()
