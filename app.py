@@ -11,7 +11,6 @@ st.set_page_config(page_title="台股高勝率短線/波段選股儀表板", pag
 st.title("📈 台股高勝率強勢股選股與盤中風控儀表板")
 st.caption("核心策略：大趨勢多頭 + MACD零軸上控盤 + 葛蘭碧波段 (B1/B2/B3) + 強勢短線爆發 (S1/S2/S3)")
 
-# 側邊欄控制
 st.sidebar.header("⚙️ 系統控制區")
 
 if st.sidebar.button("🚀 執行全台股盤後掃描"):
@@ -29,7 +28,6 @@ if st.sidebar.button("🚀 執行全台股盤後掃描"):
     status_text.success("掃描完成！")
     progress_bar.empty()
 
-# 讀取暫存/歷史結果
 csv_path = os.path.join(os.getcwd(), "scan_results.csv")
 if 'scan_df' not in st.session_state:
     if os.path.exists(csv_path):
